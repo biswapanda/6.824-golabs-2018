@@ -1,7 +1,11 @@
 package mapreduce
 
 import (
+	"encoding/csv"
 	"hash/fnv"
+	"io/ioutil"
+	"log"
+	"os"
 )
 
 func doMap(
@@ -53,6 +57,41 @@ func doMap(
 	//
 	// Your code here (Part I).
 	//
+
+	fp, err := os.Open(inFile)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	content, err := ioutil.ReadAll(fp)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	intermediateFiles := make([]*csv.Writer, nReduce)
+
+	for _, item := range mapF(inFile, string(content)) {
+		reduceTask := ihash(item.Key) % nReduce
+		w := intermediateFiles[reduceTask]
+		if w == nil {
+			f, err := os.OpenFile(reduceName(jobName, mapTask, reduceTask),
+				os.O_CREATE|os.O_WRONLY|os.O_TRUNC,
+				0644)
+			if err != nil {
+				log.Fatal(err)
+			}
+
+			w = csv.NewWriter(f)
+			intermediateFiles[reduceTask] = w
+			defer f.Close()
+		}
+		w.Write([]string{item.Key, item.Value})
+	}
+	for _, w := range intermediateFiles {
+		if w != nil {
+			w.Flush()
+		}
+	}
 }
 
 func ihash(s string) int {

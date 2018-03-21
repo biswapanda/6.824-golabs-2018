@@ -1,5 +1,13 @@
 package mapreduce
 
+import (
+	"encoding/csv"
+	"encoding/json"
+	"log"
+	"os"
+	"sort"
+)
+
 func doReduce(
 	jobName string, // the name of the whole MapReduce job
 	reduceTask int, // which reduce task this is
@@ -44,4 +52,71 @@ func doReduce(
 	//
 	// Your code here (Part I).
 	//
+
+	out, err := os.OpenFile(outFile, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer out.Close()
+
+	records := make([]KeyValue, 0, 100)
+
+	for mapTask := 0; mapTask < nMap; mapTask++ {
+		inFile := reduceName(jobName, mapTask, reduceTask)
+		f, err := os.Open(inFile)
+		if err != nil {
+			continue
+		}
+
+		r := csv.NewReader(f)
+		for {
+			record, err := r.Read()
+			if err != nil {
+				break
+			}
+			records = append(records, KeyValue{record[0], record[1]})
+		}
+	}
+
+	sort.Sort(sortRecordByKey(records))
+
+	enc := json.NewEncoder(out)
+
+	var (
+		k     string
+		start int
+	)
+	if len(records) > 0 {
+		k = records[0].Key
+	}
+
+	for i, v := range records {
+		// a new Key
+		if v.Key != k {
+			values := make([]string, 0, i-start+1)
+			for _, record := range records[start:i] {
+				values = append(values, record.Value)
+			}
+			enc.Encode(KeyValue{k, reduceF(k, values)})
+
+			start = i
+			k = v.Key
+		}
+	}
+
+	if k != "" && start < len(records) {
+		values := make([]string, 0, len(records)-start+1)
+		for _, record := range records[start:] {
+			values = append(values, record.Value)
+		}
+		enc.Encode(KeyValue{k, reduceF(k, values)})
+	}
 }
+
+type sortRecordByKey []KeyValue
+
+func (r sortRecordByKey) Len() int { return len(r) }
+
+func (r sortRecordByKey) Swap(i, j int) { r[i], r[j] = r[j], r[i] }
+
+func (r sortRecordByKey) Less(i, j int) bool { return r[i].Key < r[j].Key }

@@ -1,3 +1,5 @@
+.vscode/
 pkg/
 api.key
 *-handin.tar.gz
+debug.test

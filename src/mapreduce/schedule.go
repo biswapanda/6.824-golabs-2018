@@ -1,6 +1,10 @@
 package mapreduce
 
-import "fmt"
+import (
+	"fmt"
+	"sync"
+	"sync/atomic"
+)
 
 //
 // schedule() starts and waits for all tasks in the given phase (mapPhase
@@ -31,4 +35,61 @@ func schedule(jobName string, mapFiles []string, nReduce int, phase jobPhase, re
 	// Your code here (Part III, Part IV).
 	//
 	fmt.Printf("Schedule: %v done\n", phase)
+
+	var wg sync.WaitGroup
+	defer wg.Wait()
+
+	args := make(chan DoTaskArgs)
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < ntasks; i++ {
+			arg := DoTaskArgs{
+				JobName:       jobName,
+				Phase:         phase,
+				TaskNumber:    i,
+				NumOtherPhase: n_other,
+			}
+			if phase == mapPhase {
+				arg.File = mapFiles[i]
+			}
+			args <- arg
+		}
+	}()
+
+	var finished uint32
+	done := make(chan struct{})
+
+	for arg := range args {
+		worker := <-registerChan
+
+		wg.Add(1)
+		go func(worker string, arg DoTaskArgs) {
+			defer wg.Done()
+
+			ok := call(worker, "Worker.DoTask", arg, nil)
+
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+
+				select {
+				case registerChan <- worker:
+				case <-done:
+				}
+			}()
+
+			if ok {
+				if atomic.AddUint32(&finished, 1) == uint32(ntasks) {
+					close(args)
+					close(done)
+					return
+				}
+			} else {
+				args <- arg
+			}
+
+		}(worker, arg)
+	}
 }
