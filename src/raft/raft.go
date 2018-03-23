@@ -75,6 +75,10 @@ type Raft struct {
 	resetElectionTimer chan struct{}
 	// the current leader ID, -1 means none
 	leaderID int
+	// wake up if leader changes
+	leaderChange chan struct{}
+	// the latest index to commit, -1 means a heartbeat
+	committingIndex chan int
 
 	// Persistent state on all servers
 	currentTerm int
@@ -246,7 +250,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	}
 
 	reply.Term = rf.currentTerm
-	rf.leaderID = args.LeaderID
+	rf.resetLeader(args.LeaderID)
 }
 
 //
@@ -288,6 +292,217 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 	return ok
 }
 
+//
+// the service using Raft (e.g. a k/v server) wants to start
+// agreement on the next command to be appended to Raft's log. if this
+// server isn't the leader, returns false. otherwise start the
+// agreement and return immediately. there is no guarantee that this
+// command will ever be committed to the Raft log, since the leader
+// may fail or lose an election.
+//
+// the first return value is the index that the command will appear at
+// if it's ever committed. the second return value is the current
+// term. the third return value is true if this server believes it is
+// the leader.
+//
+func (rf *Raft) Start(command interface{}) (int, int, bool) {
+	rf.lock.Lock()
+	index := -1
+	term := rf.currentTerm
+	leaderID := rf.leaderID
+	isLeader := leaderID == rf.me
+
+	if isLeader {
+		index = len(rf.log)
+		rf.log = append(rf.log, LogEntry{
+			Command: command,
+			Index:   index,
+			Term:    term,
+		})
+
+		go rf.commit(index)
+	}
+	rf.lock.Unlock()
+	// Your code here (2B).
+
+	return index, term, isLeader
+}
+
+//
+// the tester calls Kill() when a Raft instance won't
+// be needed again. you are not required to do anything
+// in Kill(), but it might be convenient to (for example)
+// turn off debug output from this instance.
+//
+func (rf *Raft) Kill() {
+	// Your code here, if desired.
+	close(rf.done)
+}
+
+//
+// the service or tester wants to create a Raft server. the ports
+// of all the Raft servers (including this one) are in peers[]. this
+// server's port is peers[me]. all the servers' peers[] arrays
+// have the same order. persister is a place for this server to
+// save its persistent state, and also initially holds the most
+// recent saved state, if any. applyCh is a channel on which the
+// tester or service expects Raft to send ApplyMsg messages.
+// Make() must return quickly, so it should start goroutines
+// for any long-running work.
+//
+func Make(peers []*labrpc.ClientEnd, me int,
+	persister *Persister, applyCh chan ApplyMsg) *Raft {
+	rf := &Raft{}
+	rf.peers = peers
+	rf.persister = persister
+	rf.me = me
+
+	// Your initialization code here (2A, 2B, 2C).
+	rf.done = make(chan struct{})
+	rf.resetElectionTimer = make(chan struct{})
+	rf.nextIndex = make([]int, len(peers))
+	rf.matchIndex = make([]int, len(peers))
+	rf.leaderChange = make(chan struct{})
+	rf.committingIndex = make(chan int)
+	rf.leaderID = -1
+	rf.votedFor = -1
+
+	go rf.election()
+	go rf.replication()
+
+	// initialize from state persisted before a crash
+	rf.readPersist(persister.ReadRaftState())
+
+	return rf
+}
+
+func (rf *Raft) election() {
+	// since networking is simulated in this lab,
+	// so simply, only one election timeout might be enough
+	electionTimeout := time.Duration(rand.Intn(200)+100) * time.Millisecond
+
+	for {
+		select {
+		case <-time.After(electionTimeout):
+			if _, isLeader := rf.GetState(); isLeader {
+				go rf.beat()
+			} else {
+				go rf.elect()
+			}
+		case <-rf.leaderChange:
+			if _, isLeader := rf.GetState(); isLeader {
+				go rf.beat()
+			}
+		case <-rf.resetElectionTimer:
+			rf.lock.RLock()
+			log.Printf("Term(%d): peer(%d) resets election timer", rf.currentTerm, rf.me)
+			rf.lock.RUnlock()
+		case <-rf.done:
+			rf.lock.RLock()
+			log.Printf("Term(%d): peer(%d) quits", rf.currentTerm, rf.me)
+			rf.lock.RUnlock()
+			return
+		}
+	}
+}
+
+func (rf *Raft) replication() {
+	var wg sync.WaitGroup
+	defer wg.Wait()
+
+	inputs := make([]chan AppendEntriesArgs, len(rf.peers))
+	for i := 0; i < len(rf.peers); i++ {
+		if i != rf.me {
+			inputs[i] = make(chan AppendEntriesArgs, 100)
+
+			wg.Add(1)
+			go func(i int) {
+				defer wg.Done()
+
+				for {
+					select {
+					case <-rf.done:
+						return
+					case args := <-inputs[i]:
+						go rf.doReplica(args, i)
+					}
+				}
+			}(i)
+		}
+	}
+
+	for {
+		select {
+		case <-rf.done:
+			return
+		case index := <-rf.committingIndex:
+			for i := 0; i != len(rf.peers); i++ {
+				if i != rf.me {
+					go func(i int) {
+						rf.lock.RLock()
+
+						var args AppendEntriesArgs
+						args.LeaderID = rf.me
+						args.Term = rf.currentTerm
+
+						if index != -1 {
+
+						}
+
+						rf.lock.RUnlock()
+
+						select {
+						case <-rf.done:
+						case inputs[i] <- args:
+						}
+					}(i)
+				}
+			}
+		}
+	}
+}
+
+func (rf *Raft) doReplica(args AppendEntriesArgs, i int) {
+	for {
+		var reply AppendEntriesReply
+
+		log.Printf("Term(%d): sending Raft.AppendEntries(%d) RPC from peer(%d) to peer(%d)",
+			args.Term, len(args.Entries), rf.me, i)
+		if !rf.sendAppendEntries(i, &args, &reply) {
+			log.Printf("Term(%d): sent Raft.AppendEntries(%d) RPC from peer(%d) to peer(%d) failed",
+				args.Term, len(args.Entries), rf.me, i)
+
+			if len(args.Entries) == 0 {
+				return
+			}
+
+			select {
+			case <-rf.done:
+				return
+			default:
+			}
+
+			// retry infinitely
+			continue
+		}
+
+		rf.lock.Lock()
+		defer rf.lock.Unlock()
+
+		if rf.currentTerm != args.Term {
+			return
+		}
+
+		if reply.Term > rf.currentTerm {
+			// converts to a follower now
+			rf.resetState(reply.Term, follower)
+			log.Printf("Term(%d): peer(%d) becomes a follower", rf.currentTerm, rf.me)
+		}
+
+		return
+	}
+}
+
 func (rf *Raft) resetElection() {
 	// no needs to block here since the main loop routine must be
 	// either selecting this channel or immediately starting next election
@@ -297,61 +512,42 @@ func (rf *Raft) resetElection() {
 	}
 }
 
-func (rf *Raft) beat() {
-	var args AppendEntriesArgs
+func (rf *Raft) resetLeader(i int) {
+	if rf.leaderID != i {
+		rf.leaderID = i
 
-	rf.lock.RLock()
-	args.Term = rf.currentTerm
-	args.LeaderID = rf.me
-	rf.lock.RUnlock()
-
-	var wg sync.WaitGroup
-	defer wg.Wait()
-
-	for i := 0; i < len(rf.peers); i++ {
-		if i != rf.me {
-			wg.Add(1)
-			go func(i int) {
-				defer wg.Done()
-
-				var reply AppendEntriesReply
-
-				log.Printf("Term(%d): sending Raft.AppendEntries(%d) RPC from peer(%d) to peer(%d)",
-					args.Term, len(args.Entries), rf.me, i)
-				if !rf.sendAppendEntries(i, &args, &reply) {
-					log.Printf("Term(%d): sent Raft.AppendEntries(%d) RPC from peer(%d) to peer(%d) failed",
-						args.Term, len(args.Entries), rf.me, i)
-					return
-				}
-
-				rf.lock.Lock()
-				defer rf.lock.Unlock()
-
-				if rf.currentTerm != args.Term {
-					return
-				}
-
-				if reply.Term > rf.currentTerm {
-					// converts to a follower now
-					rf.resetState(reply.Term, follower)
-					log.Printf("Term(%d): peer(%d) becomes a follower", rf.currentTerm, rf.me)
-				}
-			}(i)
+		select {
+		case rf.leaderChange <- struct{}{}:
+		default:
 		}
 	}
+}
+
+func (rf *Raft) commit(index int) {
+	select {
+	case rf.committingIndex <- index:
+	case <-rf.done:
+	}
+}
+
+func (rf *Raft) beat() {
+	rf.commit(-1)
 }
 
 func (rf *Raft) elect() {
 	var args RequestVoteArgs
 
-	rf.lock.RLock()
+	rf.lock.Lock()
+	rf.resetState(rf.currentTerm+1, candidate)
+	log.Printf("Term(%d): peer(%d) becomes a candidate", rf.currentTerm, rf.me)
+
 	args.Term = rf.currentTerm
 	args.CandidateID = rf.me
 	if n := len(rf.log); n > 0 {
 		args.LastLogIndex = rf.log[n-1].Index
 		args.LastLogTerm = rf.log[n-1].Term
 	}
-	rf.lock.RUnlock()
+	rf.lock.Unlock()
 
 	var wg sync.WaitGroup
 	var voted uint32 = 1
@@ -414,116 +610,20 @@ func (rf *Raft) elect() {
 	if int(atomic.LoadUint32(&voted)) > len(rf.peers)/2 {
 		rf.lock.Lock()
 		log.Printf("Term(%d): peer(%d) becomes the leader", rf.currentTerm, rf.me)
-		rf.leaderID = rf.me
+		rf.resetLeader(rf.me)
 		rf.lock.Unlock()
 	}
 }
 
-//
-// the service using Raft (e.g. a k/v server) wants to start
-// agreement on the next command to be appended to Raft's log. if this
-// server isn't the leader, returns false. otherwise start the
-// agreement and return immediately. there is no guarantee that this
-// command will ever be committed to the Raft log, since the leader
-// may fail or lose an election.
-//
-// the first return value is the index that the command will appear at
-// if it's ever committed. the second return value is the current
-// term. the third return value is true if this server believes it is
-// the leader.
-//
-func (rf *Raft) Start(command interface{}) (int, int, bool) {
-	index := -1
-	term := -1
-	isLeader := true
-
-	// Your code here (2B).
-
-	return index, term, isLeader
-}
-
-//
-// the tester calls Kill() when a Raft instance won't
-// be needed again. you are not required to do anything
-// in Kill(), but it might be convenient to (for example)
-// turn off debug output from this instance.
-//
-func (rf *Raft) Kill() {
-	// Your code here, if desired.
-	close(rf.done)
-}
-
-//
-// the service or tester wants to create a Raft server. the ports
-// of all the Raft servers (including this one) are in peers[]. this
-// server's port is peers[me]. all the servers' peers[] arrays
-// have the same order. persister is a place for this server to
-// save its persistent state, and also initially holds the most
-// recent saved state, if any. applyCh is a channel on which the
-// tester or service expects Raft to send ApplyMsg messages.
-// Make() must return quickly, so it should start goroutines
-// for any long-running work.
-//
-func Make(peers []*labrpc.ClientEnd, me int,
-	persister *Persister, applyCh chan ApplyMsg) *Raft {
-	rf := &Raft{}
-	rf.peers = peers
-	rf.persister = persister
-	rf.me = me
-
-	// Your initialization code here (2A, 2B, 2C).
-	rf.done = make(chan struct{})
-	rf.resetElectionTimer = make(chan struct{})
-	rf.nextIndex = make([]int, len(peers))
-	rf.matchIndex = make([]int, len(peers))
-	rf.leaderID = -1
-	rf.votedFor = -1
-
-	go func() {
-		electionTimeout := time.Duration(rand.Intn(200)+100) * time.Millisecond
-		for {
-			select {
-			case <-time.After(electionTimeout):
-				if _, isLeader := rf.GetState(); isLeader {
-					// send a heartbeat
-					go rf.beat()
-				} else {
-					// be a candidate
-					rf.lock.Lock()
-					rf.resetState(rf.currentTerm+1, candidate)
-					log.Printf("Term(%d): peer(%d) becomes a candidate", rf.currentTerm, me)
-					rf.lock.Unlock()
-
-					go rf.elect()
-				}
-			case <-rf.resetElectionTimer:
-				rf.lock.RLock()
-				log.Printf("Term(%d): peer(%d) resets election timer", rf.currentTerm, rf.me)
-				rf.lock.RUnlock()
-			case <-rf.done:
-				rf.lock.RLock()
-				log.Printf("Term(%d): peer(%d) quits", rf.currentTerm, me)
-				rf.lock.RUnlock()
-				return
-			}
-		}
-	}()
-
-	// initialize from state persisted before a crash
-	rf.readPersist(persister.ReadRaftState())
-
-	return rf
-}
-
 func (rf *Raft) resetState(term int, role roleType) {
 	rf.currentTerm = term
-	rf.leaderID = -1
 	switch role {
 	case candidate:
 		rf.votedFor = rf.me
 	case follower:
 		rf.votedFor = -1
 	}
+	rf.resetLeader(-1)
 }
 
 type roleType int
