@@ -22,6 +22,7 @@ import (
 	"log"
 	"math/rand"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -39,6 +40,7 @@ import (
 // snapshots) on the applyCh; at that point you can add fields to
 // ApplyMsg, but set CommandValid to false for these other uses.
 //
+
 type ApplyMsg struct {
 	CommandValid bool
 	Command      interface{}
@@ -164,11 +166,19 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	rf.lock.Lock()
 	defer rf.lock.Unlock()
 
+	log.Printf("Term(%d): peer(%d) got RequestVote from peer(%d) with term(%d)",
+		rf.currentTerm, rf.me, args.CandidateID, args.Term)
+
 	if args.Term < rf.currentTerm {
 		return
 	}
+
+	rf.resetElection()
+
 	if args.Term > rf.currentTerm {
-		rf.currentTerm = args.Term
+		// converts to a follower
+		rf.resetState(args.Term, follower)
+		log.Printf("Term(%d): peer(%d) becomes a follower", rf.currentTerm, rf.me)
 	}
 
 	if rf.votedFor != -1 && rf.votedFor != args.CandidateID {
@@ -181,6 +191,8 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 			return
 		}
 	}
+
+	log.Printf("Term(%d): peer(%d) grants a vote to peer(%d)", rf.currentTerm, rf.me, args.CandidateID)
 
 	rf.votedFor = args.CandidateID
 	reply.Term = rf.currentTerm
@@ -216,18 +228,24 @@ type AppendEntriesReply struct {
 //
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	// Your code here (2A, 2B).
-	defer rf.resetElection()
-
 	rf.lock.Lock()
 	defer rf.lock.Unlock()
 
-	if reply.Term < rf.currentTerm {
+	log.Printf("Term(%d): peer(%d) got AppendEntries(%d) from peer(%d) with term(%d)",
+		rf.currentTerm, rf.me, len(args.Entries), args.LeaderID, args.Term)
+
+	if args.Term < rf.currentTerm {
 		return
 	}
+
+	rf.resetElection()
+
 	if args.Term > rf.currentTerm {
-		rf.currentTerm = args.Term
+		rf.resetState(args.Term, follower)
+		log.Printf("Term(%d): peer(%d) becomes a follower", rf.currentTerm, rf.me)
 	}
 
+	reply.Term = rf.currentTerm
 	rf.leaderID = args.LeaderID
 }
 
@@ -272,9 +290,9 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 
 func (rf *Raft) resetElection() {
 	// no needs to block here since the main loop routine must be
-	// either selecting this channel or preparing to start next election
+	// either selecting this channel or immediately starting next election
 	select {
-	case <-rf.resetElectionTimer:
+	case rf.resetElectionTimer <- struct{}{}:
 	default:
 	}
 }
@@ -298,9 +316,11 @@ func (rf *Raft) beat() {
 
 				var reply AppendEntriesReply
 
-				log.Printf("Term(%d): sending Raft.AppendEntries RPC from peer(%d) to peer(%d)", args.Term, rf.me, i)
+				log.Printf("Term(%d): sending Raft.AppendEntries(%d) RPC from peer(%d) to peer(%d)",
+					args.Term, len(args.Entries), rf.me, i)
 				if !rf.sendAppendEntries(i, &args, &reply) {
-					log.Printf("Error: send Raft.AppendEntries RPC to peer(%d) failed", i)
+					log.Printf("Term(%d): sent Raft.AppendEntries(%d) RPC from peer(%d) to peer(%d) failed",
+						args.Term, len(args.Entries), rf.me, i)
 					return
 				}
 
@@ -312,9 +332,9 @@ func (rf *Raft) beat() {
 				}
 
 				if reply.Term > rf.currentTerm {
-					// convert to a follower now
-					rf.currentTerm = reply.Term
-					rf.leaderID = -1
+					// converts to a follower now
+					rf.resetState(reply.Term, follower)
+					log.Printf("Term(%d): peer(%d) becomes a follower", rf.currentTerm, rf.me)
 				}
 			}(i)
 		}
@@ -334,8 +354,7 @@ func (rf *Raft) elect() {
 	rf.lock.RUnlock()
 
 	var wg sync.WaitGroup
-
-	voted := 1
+	var voted uint32 = 1
 
 	for i := 0; i < len(rf.peers); i++ {
 		if i != rf.me {
@@ -347,7 +366,7 @@ func (rf *Raft) elect() {
 
 				log.Printf("Term(%d): sending Raft.RequestVote RPC from peer(%d) to peer(%d)", args.Term, rf.me, i)
 				if !rf.sendRequestVote(i, &args, &reply) {
-					log.Printf("Error: send Raft.RequestVote RPC to peer(%d) failed", i)
+					log.Printf("Term(%d): sent Raft.RequestVote RPC from peer(%d) to peer(%d) failed", args.Term, rf.me, i)
 					return
 				}
 
@@ -360,21 +379,39 @@ func (rf *Raft) elect() {
 
 				if reply.Term > rf.currentTerm {
 					// convert to a follower now
-					rf.currentTerm = reply.Term
+					rf.resetState(reply.Term, follower)
+					log.Printf("Term(%d): peer(%d) becomes a follower", rf.currentTerm, rf.me)
 				}
 
 				if reply.VoteGranted {
-					log.Printf("Term(%d), peer(%d) got a vote from peer(%d)", rf.currentTerm, rf.me, i)
-					voted++
+					log.Printf("Term(%d): peer(%d) got a vote from peer(%d)", args.Term, rf.me, i)
+					atomic.AddUint32(&voted, 1)
 				}
 			}(i)
 		}
 	}
 
-	wg.Wait()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		wg.Wait()
+	}()
 
-	if voted > len(rf.peers)/2 {
-		// be a leader
+	tick := time.NewTicker(time.Microsecond * 50)
+	ok := false
+
+	for !ok {
+		select {
+		case <-tick.C:
+			if int(atomic.LoadUint32(&voted)) > len(rf.peers)/2 {
+				ok = true
+			}
+		case <-done:
+			ok = true
+		}
+	}
+
+	if int(atomic.LoadUint32(&voted)) > len(rf.peers)/2 {
 		rf.lock.Lock()
 		log.Printf("Term(%d): peer(%d) becomes the leader", rf.currentTerm, rf.me)
 		rf.leaderID = rf.me
@@ -435,33 +472,38 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.me = me
 
 	// Your initialization code here (2A, 2B, 2C).
-	rf.leaderID = -1
-	rf.votedFor = -1
 	rf.done = make(chan struct{})
 	rf.resetElectionTimer = make(chan struct{})
 	rf.nextIndex = make([]int, len(peers))
 	rf.matchIndex = make([]int, len(peers))
+	rf.leaderID = -1
+	rf.votedFor = -1
 
 	go func() {
+		electionTimeout := time.Duration(rand.Intn(200)+100) * time.Millisecond
 		for {
-			electionTimeout := time.Duration(rand.Intn(200)+100) * time.Millisecond
 			select {
 			case <-time.After(electionTimeout):
 				if _, isLeader := rf.GetState(); isLeader {
 					// send a heartbeat
-					rf.beat()
+					go rf.beat()
 				} else {
 					// be a candidate
 					rf.lock.Lock()
-					rf.currentTerm++
-					rf.votedFor = me
+					rf.resetState(rf.currentTerm+1, candidate)
+					log.Printf("Term(%d): peer(%d) becomes a candidate", rf.currentTerm, me)
 					rf.lock.Unlock()
 
-					rf.elect()
+					go rf.elect()
 				}
 			case <-rf.resetElectionTimer:
+				rf.lock.RLock()
+				log.Printf("Term(%d): peer(%d) resets election timer", rf.currentTerm, rf.me)
+				rf.lock.RUnlock()
 			case <-rf.done:
-				log.Println("Quit raft:", me)
+				rf.lock.RLock()
+				log.Printf("Term(%d): peer(%d) quits", rf.currentTerm, me)
+				rf.lock.RUnlock()
 				return
 			}
 		}
@@ -472,6 +514,25 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	return rf
 }
+
+func (rf *Raft) resetState(term int, role roleType) {
+	rf.currentTerm = term
+	rf.leaderID = -1
+	switch role {
+	case candidate:
+		rf.votedFor = rf.me
+	case follower:
+		rf.votedFor = -1
+	}
+}
+
+type roleType int
+
+const (
+	candidate roleType = iota
+	follower
+	leader
+)
 
 func init() {
 	log.SetFlags(log.LstdFlags | log.Lshortfile | log.Lmicroseconds)
