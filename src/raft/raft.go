@@ -69,8 +69,8 @@ type Raft struct {
 
 	lock sync.RWMutex
 
-	// pass to applyCh whenever commits a command
-	applyCh chan ApplyMsg
+	// singal to apply a committed index
+	applySingal chan struct{}
 	// indicates whether the server is done
 	done chan struct{}
 	// indicates whether the election timer resets
@@ -79,7 +79,7 @@ type Raft struct {
 	leaderID int
 	// wake up if leader changes
 	leaderChange chan struct{}
-	// the latest index to replicate
+	// the index to replicate
 	replicatingIndex chan int
 
 	// Persistent state on all servers
@@ -179,8 +179,9 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		return
 	}
 
-	rf.resetElection()
-	rf.resetState(args.Term, follower)
+	if rf.resetState(args.Term, follower) {
+		log.Printf("Term(%d): peer(%d) becomes %v", rf.currentTerm, rf.me, follower)
+	}
 
 	if rf.votedFor != -1 && rf.votedFor != args.CandidateID {
 		return
@@ -196,6 +197,11 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	}
 
 	log.Printf("Term(%d): peer(%d) grants a vote to peer(%d)", rf.currentTerm, rf.me, args.CandidateID)
+
+	// resetting here ensures that servers with the more up-to-date logs
+	// won’t be interrupted by outdated servers’ elections,
+	// and so are more likely to complete the election and become the leader
+	rf.resetElection()
 
 	rf.votedFor = args.CandidateID
 	reply.Term = rf.currentTerm
@@ -231,8 +237,8 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	rf.lock.Lock()
 	defer rf.lock.Unlock()
 
-	log.Printf("Term(%d): peer(%d) got AppendEntries(%d) from peer(%d) with term(%d)",
-		rf.currentTerm, rf.me, len(args.Entries), args.LeaderID, args.Term)
+	log.Printf("Term(%d): peer(%d) got AppendEntries(%d) from peer(%d) with term(%d), prevLogIndex(%d), leaderCommit(%d)",
+		rf.currentTerm, rf.me, len(args.Entries), args.LeaderID, args.Term, args.PrevLogIndex, args.Leadercommit)
 
 	if args.Term < rf.currentTerm {
 		return
@@ -240,36 +246,38 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 	if args.PrevLogIndex >= len(rf.log) ||
 		args.PrevLogIndex >= 0 &&
-			args.PrevLogIndex < len(rf.log) &&
 			rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
 		return
 	}
 
 	rf.resetElection()
-	rf.resetState(args.Term, follower)
+	if rf.resetState(args.Term, follower) {
+		log.Printf("Term(%d): peer(%d) becomes %v", rf.currentTerm, rf.me, follower)
+	}
+	rf.resetLeader(args.LeaderID)
 
-	for i, j := args.PrevLogIndex+1, 0; i < len(rf.log) && j < len(args.Entries); i, j = i+1, j+1 {
-		// truncating if conflicts
+	var i, j int
+	for i, j = args.PrevLogIndex+1, 0; i < len(rf.log) && j < len(args.Entries); i, j = i+1, j+1 {
+		// checking confliction
 		if rf.log[i].Term != args.Entries[j].Term {
-			rf.log = rf.log[:i]
-			args.Entries = args.Entries[j:]
 			break
 		}
 	}
 
-	rf.log = append(rf.log, args.Entries...)
+	if j < len(args.Entries) {
+		if i < len(rf.log) {
+			log.Printf("Term(%d): peer(%d) discards %d entries", rf.currentTerm, rf.me, len(rf.log)-i)
+		}
+		rf.log = append(rf.log[:i], args.Entries[j:]...)
+		log.Printf("Term(%d): peer(%d) has %d entries", rf.currentTerm, rf.me, len(rf.log))
+	}
 
 	if args.Leadercommit > rf.commitIndex && len(rf.log) > 0 {
-		rf.commitIndex = min(args.Leadercommit, len(rf.log)-1)
-
-		if rf.commitIndex > rf.lastApplied {
-			rf.lastApplied++
-		}
+		rf.commit(min(args.Leadercommit, len(rf.log)-1))
 	}
 
 	reply.Term = rf.currentTerm
 	reply.Success = true
-	rf.resetLeader(args.LeaderID)
 }
 
 //
@@ -338,11 +346,15 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 			Term:    term,
 		})
 
+		log.Printf("Term(%d): peer(%d) starts a replication with index(%d)",
+			rf.currentTerm, rf.me, index)
+		go rf.replicate(index)
 	}
+
 	rf.lock.Unlock()
 
-	go rf.replicate(index)
-	return index, term, isLeader
+	// raft is 1-indexed
+	return index + 1, term, isLeader
 }
 
 //
@@ -388,6 +400,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	go rf.election()
 	go rf.replication()
+	go rf.application(applyCh)
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
@@ -407,13 +420,20 @@ func (rf *Raft) election() {
 
 		select {
 		case <-time.After(electionTimeout):
+			rf.lock.RLock()
 			if _, isLeader := rf.GetState(); isLeader {
+				log.Printf("Term(%d): peer(%d) starts a periodical heartbeat", rf.currentTerm, rf.me)
 				go rf.beat()
 			} else {
+				log.Printf("Term(%d): peer(%d) starts a new election", rf.currentTerm, rf.me)
 				go rf.elect()
 			}
+			rf.lock.RUnlock()
 		case <-rf.leaderChange:
 			if _, isLeader := rf.GetState(); isLeader {
+				rf.lock.RLock()
+				log.Printf("Term(%d): peer(%d) starts an instant heartbeat", rf.currentTerm, rf.me)
+				rf.lock.RUnlock()
 				go rf.beat()
 			}
 		case <-rf.resetElectionTimer:
@@ -440,6 +460,52 @@ func (rf *Raft) replication() {
 	}
 }
 
+func (rf *Raft) application(ch chan<- ApplyMsg) {
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-rf.done:
+			return
+		case <-rf.applySingal:
+			rf.apply(ch)
+		case <-ticker.C:
+			rf.apply(ch)
+		}
+	}
+}
+
+func (rf *Raft) apply(ch chan<- ApplyMsg) {
+	for {
+		rf.lock.RLock()
+		commitIndex := rf.commitIndex
+		rf.lock.RUnlock()
+
+		if rf.lastApplied == commitIndex {
+			break
+		}
+
+		index := rf.lastApplied + 1
+		cmd := ApplyMsg{
+			CommandValid: true,
+			Command:      rf.log[index].Command,
+			CommandIndex: index + 1, // raft is 1-indexed
+		}
+
+		select {
+		case ch <- cmd:
+			rf.lastApplied = index
+
+			rf.lock.RLock()
+			log.Printf("Term(%d): peer(%d) applied index(%d)", rf.currentTerm, rf.me, rf.lastApplied)
+			rf.lock.RUnlock()
+		case <-rf.done:
+			return
+		}
+	}
+}
+
 func (rf *Raft) latestIndex(index int) int {
 	latest := index
 
@@ -457,84 +523,116 @@ func (rf *Raft) latestIndex(index int) int {
 
 func (rf *Raft) doReplica(index int) {
 	var (
-		wg         sync.WaitGroup
-		replicated uint32
+		replicated = int32(1)
+		total      = int32(len(rf.peers))
+		half       = total / 2
+
+		finished = make(chan struct{})
+		done     = make(chan struct{})
 	)
 
 	for i := 0; i != len(rf.peers); i++ {
 		if i != rf.me {
-			wg.Add(1)
 			go func(i int) {
-				var (
-					args  AppendEntriesArgs
-					reply AppendEntriesReply
-				)
+				defer func() {
+					if atomic.AddInt32(&total, -1) == 0 {
+						close(done)
+					}
+				}()
 
-				rf.lock.RLock()
+				for success := false; !success; {
+					var (
+						args  AppendEntriesArgs
+						reply AppendEntriesReply
+					)
 
-				args.Term = rf.currentTerm
-				args.LeaderID = rf.me
-				args.PrevLogIndex = rf.matchIndex[i]
-				if args.PrevLogIndex >= 0 && args.PrevLogIndex < len(rf.log) {
-					args.PrevLogTerm = rf.log[args.PrevLogIndex].Term
-				}
+					rf.lock.RLock()
 
-				if index >= rf.nextIndex[i] {
-					args.Entries = rf.log[rf.nextIndex[i]:]
-				}
-				args.Leadercommit = rf.commitIndex
+					args.Term = rf.currentTerm
+					args.LeaderID = rf.me
+					args.PrevLogIndex = rf.nextIndex[i] - 1
+					if args.PrevLogIndex >= 0 && args.PrevLogIndex < len(rf.log) {
+						args.PrevLogTerm = rf.log[args.PrevLogIndex].Term
+					}
 
-				rf.lock.RUnlock()
+					if rf.nextIndex[i] >= 0 && index >= rf.nextIndex[i] {
+						args.Entries = rf.log[rf.nextIndex[i]:]
+					}
+					args.Leadercommit = rf.commitIndex
 
-				log.Printf("Term(%d): sending Raft.AppendEntries(%d) RPC from peer(%d) to peer(%d)",
-					args.Term, len(args.Entries), rf.me, i)
-				if !rf.sendAppendEntries(i, &args, &reply) {
-					log.Printf("Term(%d): sent Raft.AppendEntries(%d) RPC from peer(%d) to peer(%d) failed",
+					rf.lock.RUnlock()
+
+					if args.PrevLogIndex < -1 {
+						break
+					}
+
+					log.Printf("Term(%d): sending Raft.AppendEntries(%d) RPC from peer(%d) to peer(%d)",
 						args.Term, len(args.Entries), rf.me, i)
+					if !rf.sendAppendEntries(i, &args, &reply) {
+						log.Printf("Term(%d): sent Raft.AppendEntries(%d) RPC from peer(%d) to peer(%d) failed",
+							args.Term, len(args.Entries), rf.me, i)
 
-					return
-				}
+						return
+					}
 
-				rf.lock.Lock()
-				defer rf.lock.Unlock()
+					rf.lock.Lock()
 
-				if rf.currentTerm != args.Term {
-					return
-				}
+					if rf.currentTerm != args.Term {
+						rf.lock.Unlock()
+						return
+					}
 
-				rf.resetState(reply.Term, follower)
+					if rf.resetState(reply.Term, follower) {
+						log.Printf("Term(%d): peer(%d) becomes %v", rf.currentTerm, rf.me, follower)
+					}
 
-				if reply.Success {
-					rf.matchIndex[i] = args.PrevLogIndex + len(args.Entries)
-					rf.nextIndex[i] = rf.matchIndex[i] + 1
+					success = reply.Success
+					if reply.Success {
+						rf.matchIndex[i] = args.PrevLogIndex + len(args.Entries)
+						rf.nextIndex[i] = rf.matchIndex[i] + 1
 
-					atomic.AddUint32(&replicated, 1)
-				} else {
-					rf.nextIndex[i]--
+						log.Printf("Term(%d): peer(%d) matchIndex[%d] is %d", rf.currentTerm, rf.me, i, rf.matchIndex[i])
+						if atomic.AddInt32(&replicated, 1) == half+1 {
+							close(finished)
+						}
+					} else {
+						rf.nextIndex[i]--
+					}
+
+					rf.lock.Unlock()
 				}
 			}(i)
 		}
 	}
 
-	if waitMajority(&wg, &replicated, uint32(len(rf.peers)/2)) {
+	select {
+	case <-done:
+	case <-finished:
+	case <-rf.done:
+		return
+	}
+
+	if atomic.LoadInt32(&replicated) > half {
 		rf.lock.Lock()
 		defer rf.lock.Unlock()
 
-		half := len(rf.peers) / 2
-		for i := rf.commitIndex + 1; i <= index && rf.log[i].Term == rf.currentTerm; i++ {
-			count := 1
+		commitIndex := rf.commitIndex
+
+		for i := commitIndex + 1; i <= index; i++ {
+			count := int32(1)
 			for j := 0; j < len(rf.matchIndex) && count <= half; j++ {
 				if j != rf.me && rf.matchIndex[j] >= i {
 					count++
 				}
 			}
 
-			if count > half {
-				rf.commitIndex = i
-				if rf.commitIndex > rf.lastApplied {
-					rf.lastApplied++
-				}
+			if count > half && rf.log[i].Term == rf.currentTerm {
+				commitIndex = i
 			}
+		}
+
+		if commitIndex > rf.commitIndex {
+			rf.commit(commitIndex)
 		}
 	}
 }
@@ -559,6 +657,16 @@ func (rf *Raft) resetLeader(i int) {
 	}
 }
 
+func (rf *Raft) commit(index int) {
+	log.Printf("Term(%d): peer(%d) commits index(%d)", rf.currentTerm, rf.me, index)
+	rf.commitIndex = index
+
+	select {
+	case rf.applySingal <- struct{}{}:
+	default:
+	}
+}
+
 func (rf *Raft) replicate(index int) {
 	select {
 	case rf.replicatingIndex <- index:
@@ -578,7 +686,9 @@ func (rf *Raft) elect() {
 	var args RequestVoteArgs
 
 	rf.lock.Lock()
-	rf.resetState(rf.currentTerm+1, candidate)
+	if rf.resetState(rf.currentTerm+1, candidate) {
+		log.Printf("Term(%d): peer(%d) becomes %v", rf.currentTerm, rf.me, candidate)
+	}
 
 	args.Term = rf.currentTerm
 	args.CandidateID = rf.me
@@ -588,14 +698,23 @@ func (rf *Raft) elect() {
 	}
 	rf.lock.Unlock()
 
-	var wg sync.WaitGroup
-	var voted uint32 = 1
+	var (
+		voted = int32(1)
+		total = int32(len(rf.peers))
+		half  = total / 2
+
+		finished = make(chan struct{})
+		done     = make(chan struct{})
+	)
 
 	for i := 0; i < len(rf.peers); i++ {
 		if i != rf.me {
-			wg.Add(1)
 			go func(i int) {
-				defer wg.Done()
+				defer func() {
+					if atomic.AddInt32(&total, -1) == 0 {
+						close(done)
+					}
+				}()
 
 				var reply RequestVoteReply
 
@@ -612,17 +731,28 @@ func (rf *Raft) elect() {
 					return
 				}
 
-				rf.resetState(reply.Term, follower)
+				if rf.resetState(reply.Term, follower) {
+					log.Printf("Term(%d): peer(%d) becomes %v", rf.currentTerm, rf.me, follower)
+				}
 
 				if reply.VoteGranted {
 					log.Printf("Term(%d): peer(%d) got a vote from peer(%d)", args.Term, rf.me, i)
-					atomic.AddUint32(&voted, 1)
+					if atomic.AddInt32(&voted, 1) == half+1 {
+						close(finished)
+					}
 				}
 			}(i)
 		}
 	}
 
-	if waitMajority(&wg, &voted, uint32(len(rf.peers)/2)) {
+	select {
+	case <-done:
+	case <-finished:
+	case <-rf.done:
+		return
+	}
+
+	if atomic.LoadInt32(&voted) > half {
 		rf.lock.Lock()
 		defer rf.lock.Unlock()
 
@@ -648,8 +778,6 @@ func (rf *Raft) resetState(term int, role roleType) bool {
 			rf.votedFor = -1
 		}
 		rf.resetLeader(-1)
-
-		log.Printf("Term(%d): peer(%d) becomes %v", rf.currentTerm, rf.me, role)
 		return true
 	}
 
@@ -686,32 +814,6 @@ func min(a, b int) int {
 		return a
 	}
 	return b
-}
-
-func waitMajority(wg *sync.WaitGroup, n *uint32, half uint32) bool {
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		wg.Wait()
-	}()
-
-	tick := time.NewTicker(time.Microsecond * 10)
-	defer tick.Stop()
-
-	ok := false
-
-	for !ok {
-		select {
-		case <-tick.C:
-			if atomic.LoadUint32(n) > half {
-				ok = true
-			}
-		case <-done:
-			ok = true
-		}
-	}
-
-	return atomic.LoadUint32(n) > half
 }
 
 func init() {
