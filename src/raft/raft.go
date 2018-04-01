@@ -58,7 +58,7 @@ type LogEntry struct {
 // A Go object implementing a single Raft peer.
 //
 type Raft struct {
-	mu        sync.Mutex          // Lock to protect shared access to this peer's state
+	lock      sync.RWMutex        // Lock to protect shared access to this peer's state
 	peers     []*labrpc.ClientEnd // RPC end points of all peers
 	persister *Persister          // Object to hold this peer's persisted state
 	me        int                 // this peer's index into peers[]
@@ -67,10 +67,8 @@ type Raft struct {
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
 
-	lock sync.RWMutex
-
 	// singal to apply a committed index
-	applySingal chan struct{}
+	applySignal chan struct{}
 	// indicates whether the server is done
 	done chan struct{}
 	// indicates whether the election timer resets
@@ -79,8 +77,6 @@ type Raft struct {
 	leaderID int
 	// wake up if leader changes
 	leaderChange chan struct{}
-	// the index to replicate
-	replicatingIndex chan int
 
 	// Persistent state on all servers
 	currentTerm int
@@ -226,8 +222,8 @@ type AppendEntriesArgs struct {
 // field names must start with capital letters!
 //
 type AppendEntriesReply struct {
-	Term    int
-	Success bool
+	Term   int
+	Status int // 0 for success, 1 for log inconsistency, 2 for old term
 }
 
 //
@@ -241,12 +237,14 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		rf.currentTerm, rf.me, len(args.Entries), args.LeaderID, args.Term, args.PrevLogIndex, args.Leadercommit)
 
 	if args.Term < rf.currentTerm {
+		reply.Status = 2
 		return
 	}
 
 	if args.PrevLogIndex >= len(rf.log) ||
 		args.PrevLogIndex >= 0 &&
 			rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
+		reply.Status = 1
 		return
 	}
 
@@ -264,20 +262,22 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		}
 	}
 
+	lastNewEntry := i - 1
 	if j < len(args.Entries) {
 		if i < len(rf.log) {
 			log.Printf("Term(%d): peer(%d) discards %d entries", rf.currentTerm, rf.me, len(rf.log)-i)
 		}
 		rf.log = append(rf.log[:i], args.Entries[j:]...)
-		log.Printf("Term(%d): peer(%d) has %d entries", rf.currentTerm, rf.me, len(rf.log))
+		lastNewEntry = len(rf.log) - 1
 	}
 
-	if args.Leadercommit > rf.commitIndex && len(rf.log) > 0 {
-		rf.commit(min(args.Leadercommit, len(rf.log)-1))
+	log.Printf("Term(%d): peer(%d) entries: %v", rf.currentTerm, rf.me, rf.log)
+	if args.Leadercommit > rf.commitIndex && lastNewEntry >= 0 {
+		rf.commit(min(args.Leadercommit, lastNewEntry))
 	}
 
 	reply.Term = rf.currentTerm
-	reply.Success = true
+	reply.Status = 0
 }
 
 //
@@ -346,15 +346,13 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 			Term:    term,
 		})
 
-		log.Printf("Term(%d): peer(%d) starts a replication with index(%d)",
-			rf.currentTerm, rf.me, index)
-		go rf.replicate(index)
+		log.Printf("Term(%d): peer(%d) starts a replication with index(%d) log(%v)",
+			rf.currentTerm, rf.me, index, rf.log[index])
 	}
 
 	rf.lock.Unlock()
 
-	// raft is 1-indexed
-	return index + 1, term, isLeader
+	return index, term, isLeader
 }
 
 //
@@ -390,7 +388,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.done = make(chan struct{})
 	rf.resetElectionTimer = make(chan struct{})
 	rf.leaderChange = make(chan struct{})
-	rf.replicatingIndex = make(chan int, maxReplicatingLength)
+	rf.applySignal = make(chan struct{})
 	rf.leaderID = -1
 	rf.votedFor = -1
 	rf.commitIndex = -1
@@ -399,7 +397,6 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.matchIndex = make([]int, len(peers))
 
 	go rf.election()
-	go rf.replication()
 	go rf.application(applyCh)
 
 	// initialize from state persisted before a crash
@@ -420,21 +417,26 @@ func (rf *Raft) election() {
 
 		select {
 		case <-time.After(electionTimeout):
-			rf.lock.RLock()
 			if _, isLeader := rf.GetState(); isLeader {
+				rf.lock.RLock()
 				log.Printf("Term(%d): peer(%d) starts a periodical heartbeat", rf.currentTerm, rf.me)
-				go rf.beat()
+				rf.lock.RUnlock()
+
+				go rf.replicate(100)
 			} else {
+				rf.lock.RLock()
 				log.Printf("Term(%d): peer(%d) starts a new election", rf.currentTerm, rf.me)
+				rf.lock.RUnlock()
+
 				go rf.elect()
 			}
-			rf.lock.RUnlock()
 		case <-rf.leaderChange:
 			if _, isLeader := rf.GetState(); isLeader {
 				rf.lock.RLock()
 				log.Printf("Term(%d): peer(%d) starts an instant heartbeat", rf.currentTerm, rf.me)
 				rf.lock.RUnlock()
-				go rf.beat()
+
+				go rf.replicate(0)
 			}
 		case <-rf.resetElectionTimer:
 			rf.lock.RLock()
@@ -449,17 +451,6 @@ func (rf *Raft) election() {
 	}
 }
 
-func (rf *Raft) replication() {
-	for {
-		select {
-		case <-rf.done:
-			return
-		case index := <-rf.replicatingIndex:
-			go rf.doReplica(rf.latestIndex(index))
-		}
-	}
-}
-
 func (rf *Raft) application(ch chan<- ApplyMsg) {
 	ticker := time.NewTicker(10 * time.Millisecond)
 	defer ticker.Stop()
@@ -468,7 +459,7 @@ func (rf *Raft) application(ch chan<- ApplyMsg) {
 		select {
 		case <-rf.done:
 			return
-		case <-rf.applySingal:
+		case <-rf.applySignal:
 			rf.apply(ch)
 		case <-ticker.C:
 			rf.apply(ch)
@@ -477,28 +468,26 @@ func (rf *Raft) application(ch chan<- ApplyMsg) {
 }
 
 func (rf *Raft) apply(ch chan<- ApplyMsg) {
-	for {
+	rf.lock.RLock()
+	commitIndex := rf.commitIndex
+	rf.lock.RUnlock()
+
+	for i := rf.lastApplied + 1; i <= commitIndex; i++ {
 		rf.lock.RLock()
-		commitIndex := rf.commitIndex
-		rf.lock.RUnlock()
-
-		if rf.lastApplied == commitIndex {
-			break
-		}
-
-		index := rf.lastApplied + 1
 		cmd := ApplyMsg{
 			CommandValid: true,
-			Command:      rf.log[index].Command,
-			CommandIndex: index + 1, // raft is 1-indexed
+			Command:      rf.log[i].Command,
+			CommandIndex: i,
 		}
+		rf.lock.RUnlock()
 
 		select {
 		case ch <- cmd:
-			rf.lastApplied = index
+			rf.lastApplied = i
 
 			rf.lock.RLock()
-			log.Printf("Term(%d): peer(%d) applied index(%d)", rf.currentTerm, rf.me, rf.lastApplied)
+			log.Printf("Term(%d): peer(%d) applied index(%d) cmd(%v)",
+				rf.currentTerm, rf.me, rf.lastApplied, cmd.Command)
 			rf.lock.RUnlock()
 		case <-rf.done:
 			return
@@ -506,29 +495,14 @@ func (rf *Raft) apply(ch chan<- ApplyMsg) {
 	}
 }
 
-func (rf *Raft) latestIndex(index int) int {
-	latest := index
-
-	for {
-		select {
-		case index = <-rf.replicatingIndex:
-			if index > latest {
-				latest = index
-			}
-		default:
-			return latest
-		}
-	}
-}
-
-func (rf *Raft) doReplica(index int) {
+func (rf *Raft) replicate(maxSize int) {
 	var (
 		replicated = int32(1)
 		total      = int32(len(rf.peers))
 		half       = total / 2
 
-		finished = make(chan struct{})
-		done     = make(chan struct{})
+		done   = make(chan struct{})
+		finish = make(chan struct{})
 	)
 
 	for i := 0; i != len(rf.peers); i++ {
@@ -540,7 +514,7 @@ func (rf *Raft) doReplica(index int) {
 					}
 				}()
 
-				for success := false; !success; {
+				for {
 					var (
 						args  AppendEntriesArgs
 						reply AppendEntriesReply
@@ -555,16 +529,14 @@ func (rf *Raft) doReplica(index int) {
 						args.PrevLogTerm = rf.log[args.PrevLogIndex].Term
 					}
 
-					if rf.nextIndex[i] >= 0 && index >= rf.nextIndex[i] {
-						args.Entries = rf.log[rf.nextIndex[i]:]
+					if rf.nextIndex[i] >= 0 && rf.nextIndex[i] < len(rf.log) {
+						entries := rf.log[rf.nextIndex[i]:min(len(rf.log), rf.nextIndex[i]+maxSize)]
+						args.Entries = make([]LogEntry, len(entries))
+						copy(args.Entries, entries)
 					}
 					args.Leadercommit = rf.commitIndex
 
 					rf.lock.RUnlock()
-
-					if args.PrevLogIndex < -1 {
-						break
-					}
 
 					log.Printf("Term(%d): sending Raft.AppendEntries(%d) RPC from peer(%d) to peer(%d)",
 						args.Term, len(args.Entries), rf.me, i)
@@ -586,54 +558,63 @@ func (rf *Raft) doReplica(index int) {
 						log.Printf("Term(%d): peer(%d) becomes %v", rf.currentTerm, rf.me, follower)
 					}
 
-					success = reply.Success
-					if reply.Success {
-						rf.matchIndex[i] = args.PrevLogIndex + len(args.Entries)
-						rf.nextIndex[i] = rf.matchIndex[i] + 1
+					switch reply.Status {
+					case 0:
+						if len(args.Entries) > 0 {
+							rf.matchIndex[i] = args.PrevLogIndex + len(args.Entries)
+							rf.nextIndex[i] = rf.matchIndex[i] + 1
 
-						log.Printf("Term(%d): peer(%d) matchIndex[%d] is %d", rf.currentTerm, rf.me, i, rf.matchIndex[i])
-						if atomic.AddInt32(&replicated, 1) == half+1 {
-							close(finished)
+							log.Printf("Term(%d): peer(%d) matchIndex[%d] is %d, %v",
+								rf.currentTerm, rf.me, i, rf.matchIndex[i], rf.log[rf.matchIndex[i]])
 						}
-					} else {
-						rf.nextIndex[i]--
-					}
 
-					rf.lock.Unlock()
+						if atomic.AddInt32(&replicated, 1) == half+1 {
+							close(finish)
+							commitIndex := rf.commitIndex
+
+							log.Printf("Term(%d): peer(%d) entries: %v", rf.currentTerm, rf.me, rf.log)
+
+							for i := commitIndex + 1; i < len(rf.log); i++ {
+								count := int32(1)
+								for j := 0; j < len(rf.matchIndex) && count <= half; j++ {
+									if j != rf.me && rf.matchIndex[j] >= i {
+										count++
+									}
+								}
+
+								if count > half && rf.log[i].Term == rf.currentTerm {
+									commitIndex = i
+								}
+							}
+
+							if commitIndex > rf.commitIndex {
+								rf.commit(commitIndex)
+							}
+						}
+
+						rf.lock.Unlock()
+						return
+					case 1:
+						if args.PrevLogIndex == rf.nextIndex[i]-1 {
+							rf.nextIndex[i] = args.PrevLogIndex
+							rf.lock.Unlock()
+						} else {
+							rf.lock.Unlock()
+							return
+						}
+					default:
+						rf.lock.Unlock()
+						return
+					}
 				}
 			}(i)
 		}
 	}
 
 	select {
-	case <-done:
-	case <-finished:
 	case <-rf.done:
-		return
-	}
-
-	if atomic.LoadInt32(&replicated) > half {
-		rf.lock.Lock()
-		defer rf.lock.Unlock()
-
-		commitIndex := rf.commitIndex
-
-		for i := commitIndex + 1; i <= index; i++ {
-			count := int32(1)
-			for j := 0; j < len(rf.matchIndex) && count <= half; j++ {
-				if j != rf.me && rf.matchIndex[j] >= i {
-					count++
-				}
-			}
-
-			if count > half && rf.log[i].Term == rf.currentTerm {
-				commitIndex = i
-			}
-		}
-
-		if commitIndex > rf.commitIndex {
-			rf.commit(commitIndex)
-		}
+	case <-done:
+	case <-finish:
 	}
 }
 
@@ -658,28 +639,13 @@ func (rf *Raft) resetLeader(i int) {
 }
 
 func (rf *Raft) commit(index int) {
-	log.Printf("Term(%d): peer(%d) commits index(%d)", rf.currentTerm, rf.me, index)
+	log.Printf("Term(%d): peer(%d) commits index(%d) log(%v)", rf.currentTerm, rf.me, index, rf.log[index])
 	rf.commitIndex = index
 
 	select {
-	case rf.applySingal <- struct{}{}:
+	case rf.applySignal <- struct{}{}:
 	default:
 	}
-}
-
-func (rf *Raft) replicate(index int) {
-	select {
-	case rf.replicatingIndex <- index:
-	case <-rf.done:
-	}
-}
-
-func (rf *Raft) beat() {
-	rf.lock.RLock()
-	n := len(rf.log)
-	rf.lock.RUnlock()
-
-	rf.replicate(n - 1)
 }
 
 func (rf *Raft) elect() {
@@ -692,9 +658,9 @@ func (rf *Raft) elect() {
 
 	args.Term = rf.currentTerm
 	args.CandidateID = rf.me
-	if n := len(rf.log); n > 0 {
-		args.LastLogIndex = n - 1
-		args.LastLogTerm = rf.log[n-1].Term
+	args.LastLogIndex = len(rf.log) - 1
+	if args.LastLogIndex >= 0 {
+		args.LastLogTerm = rf.log[args.LastLogIndex].Term
 	}
 	rf.lock.Unlock()
 
@@ -703,8 +669,8 @@ func (rf *Raft) elect() {
 		total = int32(len(rf.peers))
 		half  = total / 2
 
-		finished = make(chan struct{})
-		done     = make(chan struct{})
+		done   = make(chan struct{})
+		finish = make(chan struct{})
 	)
 
 	for i := 0; i < len(rf.peers); i++ {
@@ -738,7 +704,16 @@ func (rf *Raft) elect() {
 				if reply.VoteGranted {
 					log.Printf("Term(%d): peer(%d) got a vote from peer(%d)", args.Term, rf.me, i)
 					if atomic.AddInt32(&voted, 1) == half+1 {
-						close(finished)
+						close(finish)
+						log.Printf("Term(%d): peer(%d) becomes the leader", rf.currentTerm, rf.me)
+						rf.resetLeader(rf.me)
+
+						for i := 0; i < len(rf.matchIndex); i++ {
+							if i != rf.me {
+								rf.nextIndex[i] = len(rf.log)
+								rf.matchIndex[i] = -1
+							}
+						}
 					}
 				}
 			}(i)
@@ -747,24 +722,8 @@ func (rf *Raft) elect() {
 
 	select {
 	case <-done:
-	case <-finished:
+	case <-finish:
 	case <-rf.done:
-		return
-	}
-
-	if atomic.LoadInt32(&voted) > half {
-		rf.lock.Lock()
-		defer rf.lock.Unlock()
-
-		log.Printf("Term(%d): peer(%d) becomes the leader", rf.currentTerm, rf.me)
-		rf.resetLeader(rf.me)
-
-		for i := 0; i < len(rf.matchIndex); i++ {
-			if i != rf.me {
-				rf.nextIndex[i] = len(rf.log)
-				rf.matchIndex[i] = -1
-			}
-		}
 	}
 }
 
@@ -803,10 +762,6 @@ const (
 	candidate roleType = iota
 	follower
 	leader
-)
-
-const (
-	maxReplicatingLength = 10
 )
 
 func min(a, b int) int {
