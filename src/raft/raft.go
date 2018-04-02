@@ -18,7 +18,9 @@ package raft
 //
 
 import (
+	"bytes"
 	"fmt"
+	"labgob"
 	"labrpc"
 	"log"
 	"math/rand"
@@ -26,9 +28,6 @@ import (
 	"sync/atomic"
 	"time"
 )
-
-// import "bytes"
-// import "labgob"
 
 //
 // as each Raft peer becomes aware that successive log entries are
@@ -76,7 +75,9 @@ type Raft struct {
 	// the current leader ID, -1 means none
 	leaderID int
 	// wake up if leader changes
-	leaderChange chan struct{}
+	leaderChange      chan struct{}
+	lastHeartbeatTime time.Time
+	logBase           int
 
 	// Persistent state on all servers
 	currentTerm int
@@ -106,14 +107,17 @@ func (rf *Raft) GetState() (int, bool) {
 // see paper's Figure 2 for a description of what should be persistent.
 //
 func (rf *Raft) persist() {
-	// Your code here (2C).
-	// Example:
-	// w := new(bytes.Buffer)
-	// e := labgob.NewEncoder(w)
-	// e.Encode(rf.xxx)
-	// e.Encode(rf.yyy)
-	// data := w.Bytes()
-	// rf.persister.SaveRaftState(data)
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+
+	e.Encode(rf.currentTerm)
+	e.Encode(rf.votedFor)
+	e.Encode(rf.log)
+
+	data := w.Bytes()
+	rf.persister.SaveRaftState(data)
+
+	log.Printf("peer(%d) persisted: %v, %v, %v", rf.me, rf.currentTerm, rf.votedFor, rf.log)
 }
 
 //
@@ -123,19 +127,37 @@ func (rf *Raft) readPersist(data []byte) {
 	if data == nil || len(data) < 1 { // bootstrap without any state?
 		return
 	}
-	// Your code here (2C).
-	// Example:
-	// r := bytes.NewBuffer(data)
-	// d := labgob.NewDecoder(r)
-	// var xxx
-	// var yyy
-	// if d.Decode(&xxx) != nil ||
-	//    d.Decode(&yyy) != nil {
-	//   error...
-	// } else {
-	//   rf.xxx = xxx
-	//   rf.yyy = yyy
-	// }
+
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+
+	var (
+		currentTerm, votedFor int
+		entries               []LogEntry
+		err                   error
+	)
+
+	err = d.Decode(&currentTerm)
+	if err != nil {
+		log.Fatal("decoding currentTerm failed:", err)
+	}
+
+	err = d.Decode(&votedFor)
+	if err != nil {
+		log.Fatal("decoding votedFor failed:", err)
+	}
+
+	err = d.Decode(&entries)
+	if err != nil {
+		log.Fatal("decoding log failed:", err)
+		return
+	}
+
+	rf.currentTerm = currentTerm
+	rf.votedFor = votedFor
+	rf.log = entries
+
+	log.Printf("peer(%d) readPersist: %v, %v, %v", rf.me, rf.currentTerm, rf.votedFor, rf.log)
 }
 
 //
@@ -168,6 +190,11 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	rf.lock.Lock()
 	defer rf.lock.Unlock()
 
+	// the leader is alive
+	if time.Since(rf.lastHeartbeatTime) < minElectionTimeout*time.Millisecond {
+		return
+	}
+
 	log.Printf("Term(%d): peer(%d) got RequestVote from peer(%d) with term(%d)",
 		rf.currentTerm, rf.me, args.CandidateID, args.Term)
 
@@ -175,7 +202,16 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		return
 	}
 
+	needToPersist := false
+
+	defer func() {
+		if needToPersist {
+			rf.persist()
+		}
+	}()
+
 	if rf.resetState(args.Term, follower) {
+		needToPersist = true
 		log.Printf("Term(%d): peer(%d) becomes %v", rf.currentTerm, rf.me, follower)
 	}
 
@@ -202,6 +238,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	rf.votedFor = args.CandidateID
 	reply.Term = rf.currentTerm
 	reply.VoteGranted = true
+	needToPersist = true
 }
 
 //
@@ -222,8 +259,10 @@ type AppendEntriesArgs struct {
 // field names must start with capital letters!
 //
 type AppendEntriesReply struct {
-	Term   int
-	Status int // 0 for success, 1 for log inconsistency, 2 for old term
+	Term          int
+	Status        int // 0 for success, 1 for log inconsistency, 2 for old term
+	ConflictTerm  int // -1 for none
+	ConflictIndex int
 }
 
 //
@@ -241,15 +280,36 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		return
 	}
 
-	if args.PrevLogIndex >= len(rf.log) ||
-		args.PrevLogIndex >= 0 &&
-			rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
+	if args.PrevLogIndex >= len(rf.log) {
 		reply.Status = 1
+		reply.ConflictIndex = len(rf.log)
+		reply.ConflictTerm = -1
+		return
+	}
+
+	if args.PrevLogIndex >= 0 && rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
+		reply.Status = 1
+		reply.ConflictTerm = rf.log[args.PrevLogIndex].Term
+		i := args.PrevLogIndex
+		for i > 0 && rf.log[i-1].Term == reply.ConflictTerm {
+			i--
+		}
+		reply.ConflictIndex = i
 		return
 	}
 
 	rf.resetElection()
+
+	needToPersist := false
+
+	defer func() {
+		if needToPersist {
+			rf.persist()
+		}
+	}()
+
 	if rf.resetState(args.Term, follower) {
+		needToPersist = true
 		log.Printf("Term(%d): peer(%d) becomes %v", rf.currentTerm, rf.me, follower)
 	}
 	rf.resetLeader(args.LeaderID)
@@ -269,6 +329,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		}
 		rf.log = append(rf.log[:i], args.Entries[j:]...)
 		lastNewEntry = len(rf.log) - 1
+		needToPersist = true
 	}
 
 	log.Printf("Term(%d): peer(%d) entries: %v", rf.currentTerm, rf.me, rf.log)
@@ -348,6 +409,8 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 
 		log.Printf("Term(%d): peer(%d) starts a replication with index(%d) log(%v)",
 			rf.currentTerm, rf.me, index, rf.log[index])
+
+		rf.persist()
 	}
 
 	rf.lock.Unlock()
@@ -396,11 +459,11 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.nextIndex = make([]int, len(peers))
 	rf.matchIndex = make([]int, len(peers))
 
-	go rf.election()
-	go rf.application(applyCh)
-
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
+
+	go rf.election()
+	go rf.application(applyCh)
 
 	return rf
 }
@@ -410,9 +473,9 @@ func (rf *Raft) election() {
 
 	for {
 		if _, isLeader := rf.GetState(); isLeader {
-			electionTimeout = time.Duration(rand.Intn(25)+50) * time.Millisecond
+			electionTimeout = time.Duration(rand.Intn(25)+minHeartbeatTimeout) * time.Millisecond
 		} else {
-			electionTimeout = time.Duration(rand.Intn(200)+100) * time.Millisecond
+			electionTimeout = time.Duration(rand.Intn(200)+minElectionTimeout) * time.Millisecond
 		}
 
 		select {
@@ -560,6 +623,7 @@ func (rf *Raft) replicate(maxSize int) {
 					}
 
 					if rf.resetState(reply.Term, follower) {
+						rf.persist()
 						log.Printf("Term(%d): peer(%d) becomes %v", rf.currentTerm, rf.me, follower)
 					}
 
@@ -601,7 +665,19 @@ func (rf *Raft) replicate(maxSize int) {
 						return
 					case 1:
 						if args.PrevLogIndex == rf.nextIndex[i]-1 {
-							rf.nextIndex[i] = args.PrevLogIndex
+							if reply.ConflictTerm == -1 {
+								rf.nextIndex[i] = reply.ConflictIndex
+							} else {
+								j := args.PrevLogIndex
+								for j > 0 && rf.log[j-1].Term != reply.ConflictTerm {
+									j--
+								}
+								if j > 0 {
+									rf.nextIndex[i] = j
+								} else {
+									rf.nextIndex[i] = reply.ConflictIndex
+								}
+							}
 							rf.lock.Unlock()
 						} else {
 							rf.lock.Unlock()
@@ -630,6 +706,8 @@ func (rf *Raft) resetElection() {
 	case rf.resetElectionTimer <- struct{}{}:
 	default:
 	}
+
+	rf.lastHeartbeatTime = time.Now()
 }
 
 func (rf *Raft) resetLeader(i int) {
@@ -658,6 +736,7 @@ func (rf *Raft) elect() {
 
 	rf.lock.Lock()
 	if rf.resetState(rf.currentTerm+1, candidate) {
+		rf.persist()
 		log.Printf("Term(%d): peer(%d) becomes %v", rf.currentTerm, rf.me, candidate)
 	}
 
@@ -703,6 +782,7 @@ func (rf *Raft) elect() {
 				}
 
 				if rf.resetState(reply.Term, follower) {
+					rf.persist()
 					log.Printf("Term(%d): peer(%d) becomes %v", rf.currentTerm, rf.me, follower)
 				}
 
@@ -767,6 +847,11 @@ const (
 	candidate roleType = iota
 	follower
 	leader
+)
+
+const (
+	minHeartbeatTimeout = 50
+	minElectionTimeout  = 100
 )
 
 func min(a, b int) int {
