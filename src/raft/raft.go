@@ -522,6 +522,11 @@ func (rf *Raft) replicate(maxSize int) {
 
 					rf.lock.RLock()
 
+					if rf.leaderID != rf.me {
+						rf.lock.RUnlock()
+						return
+					}
+
 					args.Term = rf.currentTerm
 					args.LeaderID = rf.me
 					args.PrevLogIndex = rf.nextIndex[i] - 1
